@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""whenup: queue shell jobs for machines that are offline; they run when the machine comes back.
+
+The queue is a plain git repository (any remote you can push to). Jobs are JSON files under
+pending/<machine>/; when a machine runs one it moves the file to done/<machine>/ with the result
+and pushes, so every other machine can see what happened.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+HOME = Path.home()
+CONFIG_PATH = Path(os.environ.get("WHENUP_CONFIG", HOME / ".config/whenup/config.toml"))
+DATA_DIR = Path(os.environ.get("WHENUP_DATA", HOME / ".local/share/whenup"))
+STATE_DIR = Path(os.environ.get("WHENUP_STATE", HOME / ".local/state/whenup"))
+OUTPUT_KEEP = 8000  # characters of job output stored in the queue
+
+
+# ── config ──────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    cfg = {"name": socket.gethostname(), "aliases": [], "queue": "", "notify": True,
+           "shell": "bash", "timeout": 1800, "branch": "main"}
+    if CONFIG_PATH.exists():
+        cfg.update(tomllib.loads(CONFIG_PATH.read_text()))
+    if not cfg["queue"]:
+        die(f"no queue configured: run `whenup init <git-remote>` (config: {CONFIG_PATH})")
+    return cfg
+
+
+def my_names(cfg: dict) -> list[str]:
+    return [cfg["name"], *cfg.get("aliases", [])]
+
+
+def write_config(queue: str, name: str, aliases: list[str], windows_host: bool = False) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# whenup config: see https://github.com/Tjabooo/whenup#configuration",
+        f"queue = {json.dumps(queue)}",
+        f"name = {json.dumps(name)}",
+        f"aliases = {json.dumps(aliases)}",
+        "notify = true",
+        'shell = "bash"',
+        "timeout = 1800",
+    ]
+    if windows_host:  # Windows OpenSSH runs cmd.exe, which keeps git's quotes; PowerShell strips them
+        lines += ['upload_pack = "powershell git-upload-pack"', 'receive_pack = "powershell git-receive-pack"']
+    lines.append("")
+    CONFIG_PATH.write_text("\n".join(lines))
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+def die(msg: str, code: int = 1):
+    print(f"whenup: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def git(*args: str, check: bool = True, quiet: bool = False) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+           "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=8")}
+    p = subprocess.run(["git", "-C", str(repo_dir()), *args], capture_output=True, text=True, env=env)
+    if check and p.returncode != 0:
+        if not quiet:
+            print((p.stderr or p.stdout).strip(), file=sys.stderr)
+        raise GitError(f"git {' '.join(args)} failed")
+    return p
+
+
+class GitError(RuntimeError):
+    pass
+
+
+def repo_dir() -> Path:
+    return DATA_DIR / "queue"
+
+
+def ensure_clone(cfg: dict) -> None:
+    repo = repo_dir()
+    if (repo / ".git").exists():
+        return
+    repo.parent.mkdir(parents=True, exist_ok=True)
+    extra = ["-u", cfg["upload_pack"]] if cfg.get("upload_pack") else []
+    p = subprocess.run(["git", "clone", "-q", *extra, cfg["queue"], str(repo)], capture_output=True, text=True,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if p.returncode != 0:
+        die(f"could not clone the queue {cfg['queue']}:\n{p.stderr.strip()}")
+    for key in ("upload_pack", "receive_pack"):  # e.g. "powershell git-upload-pack" for Windows OpenSSH hosts
+        if cfg.get(key):
+            git("config", f"remote.origin.{key.replace('_', '')}", cfg[key])
+    git("config", "user.name", f"whenup@{cfg['name']}")
+    git("config", "user.email", "whenup@localhost")
+    if git("rev-parse", "--verify", "HEAD", check=False).returncode != 0:  # empty remote
+        git("checkout", "-q", "-b", cfg.get("branch", "main"))
+        (repo / "README.md").write_text("# whenup queue\n\nJobs for [whenup](https://github.com/Tjabooo/whenup). "
+                                        "`pending/<machine>/` waits, `done/<machine>/` ran.\n")
+        git("add", "README.md")
+        git("commit", "-q", "-m", "whenup: new queue")
+        git("push", "-q", "-u", "origin", "HEAD")
+
+
+def sync(cfg: dict, wait: int = 0) -> bool:
+    """Pull the queue. With wait > 0, keep retrying (network may still be coming up at boot)."""
+    ensure_clone(cfg)
+    deadline = time.monotonic() + wait
+    while True:
+        if git("pull", "-q", "--rebase", "-X", "theirs", check=False).returncode == 0:
+            return True
+        git("rebase", "--abort", check=False)
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(5)
+
+
+def publish(message: str, paths: list[str]) -> bool:
+    git("add", "-A")  # the queue repo holds only whenup files
+    if git("diff", "--cached", "--quiet", check=False).returncode != 0:
+        git("commit", "-q", "-m", message)
+    ahead = git("rev-list", "--count", "@{u}..HEAD", check=False)
+    if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+        return True
+    for _ in range(4):
+        if git("push", "-q", check=False).returncode == 0:
+            return True
+        git("pull", "-q", "--rebase", "-X", "theirs", check=False)
+        git("rebase", "--abort", check=False)
+    print("whenup: couldn't push yet; the change is committed locally and goes out on the next run",
+          file=sys.stderr)
+    return False
+
+
+def all_jobs(state: str = "pending", target: str | None = None) -> list[tuple[Path, dict]]:
+    base = repo_dir() / state
+    if not base.exists():
+        return []
+    files = sorted(base.glob(f"{target or '*'}/*.json"), key=lambda p: p.name)
+    out = []
+    for f in files:
+        try:
+            out.append((f, json.loads(f.read_text())))
+        except (OSError, json.JSONDecodeError):
+            print(f"whenup: skipping unreadable {f}", file=sys.stderr)
+    return out
+
+
+def find_job(job_id: str) -> tuple[Path, dict, str]:
+    for state in ("pending", "done"):
+        for path, job in all_jobs(state):
+            if job["id"] == job_id or job["id"].endswith(job_id):
+                return path, job, state
+    die(f"no job {job_id}")
+
+
+def rel(path: Path) -> str:
+    return str(path.relative_to(repo_dir()))
+
+
+def notify(cfg: dict, title: str, body: str, urgent: bool = False) -> None:
+    if cfg.get("notify") and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "whenup", "-u", "critical" if urgent else "normal", title, body],
+                       capture_output=True, timeout=10)
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def cmd_init(a) -> None:
+    name = a.name or socket.gethostname()
+    aliases = [x for x in (a.alias or []) if x != name]
+    if CONFIG_PATH.exists() and not a.force:
+        die(f"{CONFIG_PATH} exists (use --force to overwrite)")
+    write_config(a.queue, name, aliases, a.windows_host)
+    cfg = load_config()
+    ensure_clone(cfg)
+    print(f"whenup: this machine is '{name}'" + (f" (also {', '.join(aliases)})" if aliases else ""))
+    print(f"whenup: queue {a.queue} cloned to {repo_dir()}")
+    print("whenup: run `whenup install-timer` so jobs run at boot and every 10 minutes")
+
+
+def read_script(a) -> str:
+    if a.file:
+        return Path(a.file).read_text()
+    if a.command:
+        return a.command[0] if len(a.command) == 1 else shlex.join(a.command)
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    die("give the job as `-- command ...`, `-f script.sh`, or on stdin")
+
+
+def cmd_add(a) -> None:
+    cfg = load_config()
+    script = read_script(a).rstrip() + "\n"
+    if not script.strip():
+        die("empty job")
+    if not sync(cfg):
+        print("whenup: couldn't reach the queue, the job is queued locally and goes out on the next push",
+              file=sys.stderr)
+    stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S%f")[:18]  # ms, so ids sort in queue order
+    targets = a.target.split(",")
+    for target in targets:
+        job = {
+            "id": f"{stamp}-{secrets.token_hex(2)}",
+            "target": target,
+            "title": a.title or script.strip().splitlines()[0][:72],
+            "script": script,
+            "cwd": a.cwd or "~",
+            "timeout": a.timeout or cfg["timeout"],
+            "created": now(),
+            "from": cfg["name"],
+        }
+        path = repo_dir() / "pending" / target / f"{job['id']}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(job, indent=2) + "\n")
+        print(f"queued {job['id']} for {target}: {job['title']}")
+    publish(f"queue: {a.title or 'job'} → {a.target}", ["pending"])
+    if a.kick:
+        for target in targets:
+            kick(target)
+
+
+def kick(target: str) -> None:
+    p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", target,
+                        "systemctl --user start --no-block whenup.service || ~/.local/bin/whenup run"],
+                       capture_output=True, text=True)
+    print(f"{target}: " + ("online, running now" if p.returncode == 0 else "offline, runs when it's back"))
+
+
+def cmd_kick(a) -> None:
+    for target in a.target.split(","):
+        kick(target)
+
+
+def run_job(cfg: dict, job: dict) -> dict:
+    cwd = Path(os.path.expanduser(job.get("cwd") or "~"))
+    if not cwd.is_dir():
+        cwd = HOME
+    env = {**os.environ, "WHENUP_JOB": job["id"], "WHENUP_TARGET": job["target"],
+           "PATH": f"{HOME}/.local/bin:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+    started = now()
+    t0 = time.monotonic()
+    try:
+        p = subprocess.run([cfg.get("shell", "bash"), "-c", job["script"]], cwd=cwd, env=env,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, errors="replace", timeout=int(job.get("timeout") or cfg["timeout"]))
+        code, output = p.returncode, p.stdout
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or ""
+        code, output = 124, (out.decode(errors="replace") if isinstance(out, bytes) else out) + "\n[whenup: timed out]"
+    except OSError as e:
+        code, output = 127, f"[whenup: couldn't start {cfg.get('shell')}: {e}]"
+    if len(output) > OUTPUT_KEEP:
+        output = "[…]\n" + output[-OUTPUT_KEEP:]
+    return {"ran_on": cfg["name"], "started": started, "finished": now(),
+            "seconds": round(time.monotonic() - t0, 1), "exit": code,
+            "status": "ok" if code == 0 else "failed", "output": output}
+
+
+def cmd_run(a) -> None:
+    cfg = load_config()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE_DIR / "run.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("whenup: another run is in progress")
+        return
+    online = sync(cfg, wait=a.wait)
+    if not online:
+        print("whenup: queue unreachable, running whatever was already pulled", file=sys.stderr)
+    jobs = [j for n in my_names(cfg) for j in all_jobs("pending", n)]
+    jobs.sort(key=lambda pj: pj[1]["id"])
+    ran = failed = 0
+    for path, job in jobs:
+        if a.dry_run:
+            print(f"would run {job['id']} ({job['title']}) from {job.get('from', '?')}")
+            continue
+        print(f"running {job['id']}: {job['title']}", flush=True)
+        job["result"] = run_job(cfg, job)
+        done = repo_dir() / "done" / job["target"] / path.name
+        done.parent.mkdir(parents=True, exist_ok=True)
+        done.write_text(json.dumps(job, indent=2) + "\n")
+        path.unlink()
+        ran += 1
+        ok = job["result"]["status"] == "ok"
+        failed += not ok
+        print(f"  {job['result']['status']} (exit {job['result']['exit']}, {job['result']['seconds']} s)")
+        # commit each result right away, so a crash or power cut can't run a job twice
+        git("add", "-A")
+        git("commit", "-q", "-m", f"{'ran' if ok else 'failed'}: {job['title']} on {cfg['name']}", check=False)
+    (STATE_DIR / "last-run").write_text(now() + "\n")
+    if ran:
+        publish(f"results from {cfg['name']}", ["pending", "done"])
+        title = f"whenup ran {ran} queued job{'s' * (ran != 1)}"
+        body = "\n".join(f"{'✓' if j.get('result', {}).get('status') == 'ok' else '✗'} {j['title']}" for _, j in jobs)
+        notify(cfg, title + (f", {failed} failed" if failed else ""), body, urgent=bool(failed))
+    elif online:
+        publish(f"results from {cfg['name']}", ["pending", "done"])  # flush anything left from an offline run
+
+
+def fmt_job(job: dict, state: str) -> str:
+    r = job.get("result")
+    mark = "…" if state == "pending" else ("✓" if r and r["status"] == "ok" else "✗")
+    when = (r or {}).get("finished", job["created"])[:16].replace("T", " ")
+    return f"{mark} {job['id']}  {job['target']:<12} {when}  {job['title']}"
+
+
+def cmd_list(a) -> None:
+    cfg = load_config()
+    if not sync(cfg):
+        print("whenup: queue unreachable, showing the last copy", file=sys.stderr)
+    pending = all_jobs("pending", a.target)
+    for _, job in pending:
+        print(fmt_job(job, "pending"))
+    if not pending:
+        print("nothing waiting" + (f" for {a.target}" if a.target else ""))
+    done = sorted(all_jobs("done", a.target), key=lambda pj: pj[1]["result"]["finished"] if "result" in pj[1] else "")
+    if done and a.done:
+        print()
+        for _, job in done[-a.done:]:
+            print(fmt_job(job, "done"))
+
+
+def cmd_show(a) -> None:
+    cfg = load_config()
+    sync(cfg)
+    _, job, state = find_job(a.id)
+    print(fmt_job(job, state))
+    print(f"  from {job.get('from', '?')} at {job['created']}, cwd {job.get('cwd', '~')}\n")
+    print(job["script"].rstrip())
+    if job.get("result"):
+        r = job["result"]
+        print(f"\n── {r['status']} on {r['ran_on']} at {r['finished']} (exit {r['exit']}, {r['seconds']} s) ──")
+        print(r["output"].rstrip() or "(no output)")
+
+
+def cmd_cancel(a) -> None:
+    cfg = load_config()
+    sync(cfg)
+    path, job, state = find_job(a.id)
+    if state != "pending":
+        die(f"{job['id']} already ran")
+    path.unlink()
+    publish(f"cancel: {job['title']} → {job['target']}", ["pending"])
+    print(f"cancelled {job['id']}")
+
+
+def cmd_retry(a) -> None:
+    cfg = load_config()
+    sync(cfg)
+    path, job, state = find_job(a.id)
+    if state != "done":
+        die(f"{job['id']} hasn't run yet")
+    job.setdefault("history", []).append(job.pop("result"))
+    new = repo_dir() / "pending" / job["target"] / path.name
+    new.parent.mkdir(parents=True, exist_ok=True)
+    new.write_text(json.dumps(job, indent=2) + "\n")
+    path.unlink()
+    publish(f"retry: {job['title']} → {job['target']}", ["pending", "done"])
+    print(f"{job['id']} queued again for {job['target']}")
+
+
+def cmd_status(a) -> None:
+    cfg = load_config()
+    reachable = sync(cfg)
+    last = (STATE_DIR / "last-run").read_text().strip() if (STATE_DIR / "last-run").exists() else "never"
+    mine = sum(len(all_jobs("pending", n)) for n in my_names(cfg))
+    timer = subprocess.run(["systemctl", "--user", "is-active", "whenup.timer"], capture_output=True, text=True)
+    print(f"machine   {cfg['name']}" + (f" (also {', '.join(cfg['aliases'])})" if cfg.get("aliases") else ""))
+    print(f"queue     {cfg['queue']} ({'reachable' if reachable else 'UNREACHABLE'})")
+    print(f"timer     {timer.stdout.strip() or 'not installed'}")
+    print(f"last run  {last}")
+    print(f"waiting   {mine} here, {len(all_jobs('pending'))} in total")
+
+
+SERVICE = """[Unit]
+Description=whenup: run jobs queued for this machine while it was offline
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={exe} run --wait 120
+Nice=5
+"""
+
+TIMER = """[Unit]
+Description=whenup: check the queue at boot and every 10 minutes
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=10min
+RandomizedDelaySec=20s
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def cmd_install_timer(a) -> None:
+    exe = Path(shutil.which("whenup") or sys.argv[0]).resolve()
+    units = HOME / ".config/systemd/user"
+    units.mkdir(parents=True, exist_ok=True)
+    (units / "whenup.service").write_text(SERVICE.format(exe=exe))
+    (units / "whenup.timer").write_text(TIMER)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "whenup.timer"], check=True)
+    print(f"whenup: timer enabled ({units}/whenup.timer); `loginctl enable-linger` makes it run before you log in")
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(prog="whenup", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=f"whenup {__version__}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="point this machine at a queue (any git remote)")
+    p.add_argument("queue")
+    p.add_argument("--name", help="this machine's name in the queue (default: hostname)")
+    p.add_argument("--alias", action="append", help="another name jobs can use for this machine")
+    p.add_argument("--windows-host", action="store_true", help="the queue lives on a Windows OpenSSH server")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("add", help="queue a job for one or more machines (comma-separated)")
+    p.add_argument("target")
+    p.add_argument("-t", "--title")
+    p.add_argument("-f", "--file", help="run this script file")
+    p.add_argument("-C", "--cwd", help="working directory on the target (default ~)")
+    p.add_argument("--timeout", type=int, help="seconds before the job is killed")
+    p.add_argument("--kick", action="store_true", help="if the target is up, make it run now over SSH")
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("run", help="run the jobs waiting for this machine (the timer calls this)")
+    p.add_argument("--wait", type=int, default=0, help="keep retrying the queue this many seconds")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("list", aliases=["ls"], help="show waiting jobs (and recent results)")
+    p.add_argument("target", nargs="?")
+    p.add_argument("-d", "--done", type=int, default=5, metavar="N", help="also show the last N results")
+    p.set_defaults(fn=cmd_list)
+
+    for name, fn, hlp in (("show", cmd_show, "show a job's script and output"),
+                          ("cancel", cmd_cancel, "remove a job that hasn't run"),
+                          ("retry", cmd_retry, "queue a job that already ran again")):
+        p = sub.add_parser(name, help=hlp)
+        p.add_argument("id", help="job id (or its unique ending)")
+        p.set_defaults(fn=fn)
+
+    p = sub.add_parser("kick", help="ask an online machine to run its queue now (SSH)")
+    p.add_argument("target")
+    p.set_defaults(fn=cmd_kick)
+
+    sub.add_parser("status", help="this machine's queue, timer and last run").set_defaults(fn=cmd_status)
+    sub.add_parser("install-timer", help="install the systemd user timer").set_defaults(fn=cmd_install_timer)
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    command = []
+    if "--" in argv:  # everything after -- is the job itself
+        i = argv.index("--")
+        argv, command = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    a.command = command
+    try:
+        a.fn(a)
+    except GitError as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()
